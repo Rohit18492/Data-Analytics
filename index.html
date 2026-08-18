@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PathForge — 6-Month Data Engineering + Databricks + Fabric + GenAI</title>
+  <link rel="stylesheet" href="css/app.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <h1>PathForge SSOT</h1>
+        <p>Qlik → Data Engineer → Data &amp; AI Architect</p>
+      </div>
+      <div class="side-search"><input id="navFilter" placeholder="Filter nav..." /></div>
+      <nav class="nav" id="nav"></nav>
+    </aside>
+    <section class="main">
+      <header class="topbar">
+        <input id="globalSearch" class="grow" placeholder="Search lessons, quizzes, projects, glossary, interview Qs..." />
+        <button class="icon-btn" id="themeBtn" title="Toggle theme">Theme</button>
+        <button class="icon-btn" id="bookmarkNav">Bookmarks</button>
+        <button class="btn primary" data-go="dashboard">Dashboard</button>
+      </header>
+      <main class="content" id="view"></main>
+    </section>
+  </div>
+  <div class="modal" id="modal"><div class="box" id="modalBox"></div></div>
+
+  <script src="js/data/meta.js"></script>
+  <script src="js/data/lessons.js"></script>
+  <script src="js/data/days.js"></script>
+  <script src="js/data/quizzes.js"></script>
+  <script src="js/data/flashcards.js"></script>
+  <script src="js/data/interview.js"></script>
+  <script src="js/data/projects.js"></script>
+  <script src="js/data/scenarios.js"></script>
+  <script src="js/data/glossary.js"></script>
+  <script src="js/data/refs.js"></script>
+  <script src="js/data/labs.js"></script>
+  <script src="js/data/career.js"></script>
+  <script src="js/engine.js"></script>
+</body>
+</html>
