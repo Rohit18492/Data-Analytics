@@ -94,7 +94,7 @@
       capstone: viewCapstone, quizzes: viewQuizzes, flashcards: viewFlash, interview: viewInterview,
       cheats: viewCheats, diagrams: viewDiagrams, library: viewLibrary, books: viewBooks,
       glossary: viewGlossary, certs: viewCerts, changelog: viewChangelog, progress: viewProgress,
-      plan: viewPlan, weekly: viewWeekly, monthly: viewMonthly, genai: () => viewMonth(7),
+      plan: viewPlan, weekly: viewWeekly, monthly: viewMonthly, genai: (v) => viewMonth(7, v),
       bookmarks: viewBookmarks, career: viewCareer, freelance: viewFreelance, simulator: viewSimulator,
       bootcamp: viewBootcamp, codelabs: viewCodeLabs, debug: viewDebug, archlab: viewArch, scenarios: viewScenarios
     };
@@ -721,27 +721,45 @@
     return hits.slice(0, 40);
   }
 
-  document.body.addEventListener("click", (e) => {
-    const t = e.target.closest("[data-go]");
-    if (t && t.dataset.go) { e.preventDefault(); go(t.dataset.go); }
-  });
-  $("#navFilter").oninput = renderNav;
-  $("#themeBtn").onclick = () => {
-    S.theme = S.theme === "dark" ? "light" : "dark";
+  function bindChrome() {
+    document.body.addEventListener("click", (e) => {
+      const t = e.target.closest("[data-go]");
+      if (t && t.dataset.go) { e.preventDefault(); go(t.dataset.go); }
+    });
+    const navFilter = $("#navFilter");
+    if (navFilter) navFilter.oninput = renderNav;
+    const themeBtn = $("#themeBtn");
+    if (themeBtn) themeBtn.onclick = () => {
+      S.theme = S.theme === "dark" ? "light" : "dark";
+      document.documentElement.dataset.theme = S.theme === "light" ? "light" : "";
+      save();
+    };
     document.documentElement.dataset.theme = S.theme === "light" ? "light" : "";
-    save();
-  };
-  document.documentElement.dataset.theme = S.theme === "light" ? "light" : "";
-  $("#globalSearch").oninput = () => {
-    const hits = searchAll($("#globalSearch").value);
-    if (!$("#globalSearch").value) return;
-    const modal = $("#modal"); const box = $("#modalBox");
-    box.innerHTML = `<h3>Search</h3>${hits.map(h=>`<div class="search-hit" data-go="${h.go}">${esc(h.title)}</div>`).join("")||"<p>No hits</p>"}`;
-    modal.classList.add("on");
-    modal.onclick = (e) => { if (e.target === modal) modal.classList.remove("on"); };
-  };
-  $("#bookmarkNav").onclick = () => go("bookmarks");
-  window.addEventListener("hashchange", route);
-  renderNav();
-  route();
+    const gs = $("#globalSearch");
+    if (gs) gs.oninput = () => {
+      const hits = searchAll(gs.value);
+      if (!gs.value) return;
+      const modal = $("#modal"); const box = $("#modalBox");
+      if (!modal || !box) return;
+      box.innerHTML = `<h3>Search</h3>${hits.map(h=>`<div class="search-hit" data-go="${h.go}">${esc(h.title)}</div>`).join("")||"<p>No hits</p>"}`;
+      modal.classList.add("on");
+      modal.onclick = (e) => { if (e.target === modal) modal.classList.remove("on"); };
+    };
+    const bm = $("#bookmarkNav");
+    if (bm) bm.onclick = () => go("bookmarks");
+    window.addEventListener("hashchange", route);
+    renderNav();
+    route();
+  }
+
+  try {
+    bindChrome();
+  } catch (err) {
+    const view = document.getElementById("view");
+    if (view) {
+      view.innerHTML = `<div class="card"><h2>PathForge failed to start</h2><pre>${esc(err && err.stack ? err.stack : String(err))}</pre>
+        <p>Double-click the bundled <code>index.html</code> from a full clone of this repo, or use a local server from the repo root.</p></div>`;
+    }
+    console.error(err);
+  }
 })();
