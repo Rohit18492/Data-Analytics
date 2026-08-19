@@ -77,22 +77,42 @@ LOAD
     %Campaign_Region_KEY,
     %Campaign_KEY,
     %FACT_to_FACILITY_KEY,
+    %FACT_to_FACILITY_KEY_REGIONS,
+    Campaign,
+    [Campaign Category],
+    SKILL_KEY,
+    [Skill Name],
+    [Old Mission Center Region],
+    [Location Name],
+    [Location Name New],
+    ApplyMap('MAP_LOCATION_ALIAS', Lower([Original Location Name]), [Original Location Name]) as [Original Location Name],
+    [Contact Location Name],
+    %Location_Key,
+    [Location ID],
+    Neighborhood,
+    Unit,
+    [Region Source],
+    [Level of Care Name] AS [LOC TEMP];
+LOAD
+    %Campaign_Region_KEY,
+    %Campaign_KEY,
+    %FACT_to_FACILITY_KEY,
     %FACT_to_FACILITY_KEY as %FACT_to_FACILITY_KEY_REGIONS,
     Campaign,
     [Campaign Category],
     SKILL_KEY,
     [Skill Name],
-    "Mission Center Region" as "Old Mission Center Region",
-    "Location Name",
-    "Location Name New",
-    ApplyMap('MAP_LOCATION_ALIAS', Lower([Original Location Name]), [Original Location Name]) as [Original Location Name],
-    "Contact Location Name",
+    [Mission Center Region] as [Old Mission Center Region],
+    [Location Name],
+    [Location Name New],
+    [Original Location Name],
+    [Contact Location Name],
     %Location_Key,
-    "Location ID",
+    [Location ID],
     Neighborhood,
     Unit,
-    "Region Source",
-    "Level of Care Name" AS [LOC TEMP]
+    [Region Source],
+    [Level of Care Name]
 FROM
     [lib://QlikSense QVD Location (ad_svc-qlikadmin)/QlikSense/QVD/Transformed/E2E L2 Transform/7.MasterData/M_Regions.qvd]
     (qvd);
@@ -174,7 +194,6 @@ Mapping LOAD
 Resident TMP_MC_KPI_REGION_SORT;
 
 Drop Table TMP_MC_KPI_REGION_SORT;
-DISCONNECT;
 
 
 // ---------------------------------------------------------------------------
@@ -223,7 +242,13 @@ LOAD
     ) as Programs,
     ct as [Stepdown Counter],
     stepdown,
-    ApplyMap('MAP_LOCATION_ALIAS', Lower(location_value), location_value) as [Original Location Name]
+    ApplyMap('MAP_LOCATION_ALIAS', Lower(location_value), location_value) as [Original Location Name];
+LOAD
+    location_value,
+    transaction_dt,
+    program_x_rrg_code,
+    ct,
+    stepdown
 FROM
     [lib://QlikSense QVD Location (ad_svc-qlikadmin)/QlikSense/QVD/Extracts/E2E L1 Extract/04.ALOS/RT_Discharge_Stepdown_ALOS.qvd]
     (qvd);
