@@ -1,0 +1,667 @@
+// ============================================================================
+// READMIT APP — LOAD SCRIPT
+// Stream: Operations
+// Replaces the 2026-04-29 script and the 2026-10-16 draft that were pasted
+// back to back (running both auto-concatenated or failed the reload).
+//
+// Aftercare maps are built first, then one readmit pass consumes them.
+// Set v_dev_qa to 1 for a dev reload. QA_* tables are not part of the model
+// associations (every QA field is prefixed).
+//
+// Open item, unchanged on purpose:
+//   LEAD() still runs on the filtered discharge set, so a next stay that was
+//   excluded (same-day episode, null discharge, discharge outside the window)
+//   is invisible. Moving LEAD() outside that filter changes published rates;
+//   do that only with Pete/Jony.
+// ============================================================================
+
+SET v_dev_qa = 0;
+
+SET v_grace_period_30 = 30;
+SET v_grace_period_90 = 90;
+
+// Num(..., '0', '.', '') keeps dollar-expansion numeric. A raw date dual
+// expands as text (7/29/2026), and $(v) then becomes division inside WHERE.
+LET v_start_date_num = Num(MakeDate(2024, 1, 1), '0', '.', '');
+LET v_end_date_num   = Num(Floor(Today()), '0', '.', '');
+LET v_grace_end_30   = Num($(v_end_date_num) - $(v_grace_period_30), '0', '.', '');
+LET v_grace_end_90   = Num($(v_end_date_num) - $(v_grace_period_90), '0', '.', '');
+
+LET v_start_date_sql       = Date($(v_start_date_num), 'YYYY-MM-DD');
+LET v_end_date_sql         = Date($(v_end_date_num), 'YYYY-MM-DD');
+LET v_aftercare_cutoff_sql = '2023-10-24';
+
+TRACE *** Readmit load. QA=$(v_dev_qa). Discharges $(v_start_date_sql) through $(v_end_date_sql). Grace ends 30=$(v_grace_end_30) 90=$(v_grace_end_90).;
+
+
+// ============================================================================
+// REGION MAP
+// Keys are stored uppercased and trimmed. Lookup does the same.
+// Default 'Unknown' — sites missing from this list stay visible.
+// ============================================================================
+
+Region_Location_Mapping:
+MAPPING LOAD
+    Upper(Trim([Original Location Name])) AS SiteKey,
+    Trim([Region Type])                   AS Region
+INLINE [
+Original Location Name, Region Type
+BRACEBRIDGE, East
+"CAPITAL REGION", East
+DANVERS, West
+WESTMINSTER, West
+LIGHTHOUSE, East
+"LIGHTHOUSE MAYS LANDING", East
+"RARITAN BAY", East
+DEVON, East
+"DEVON SUD", East
+INDIANAPOLIS, West
+GREENVILLE, West
+"ST. CHARLES", West
+MONROEVILLE, West
+"MT. DORA", West
+"MOUNT DORA", West
+];
+
+
+// ============================================================================
+// GUARANTOR TYPE MAP
+// Replaces the nested If() whose parentheses were only accidentally balanced.
+// Any id not listed is 'Others', same as before.
+// ============================================================================
+
+Guarantor_Type_Map:
+MAPPING LOAD
+    Text(GUARANTOR_ID) AS GUARANTOR_ID,
+    [Guarantor Type]
+INLINE [
+GUARANTOR_ID, Guarantor Type
+400, Horizon
+401, Horizon
+498, Horizon
+499, Horizon
+402, IBX
+403, IBX
+406, IBX
+410, IBX
+412, IBX
+826, CCBH
+9700, Optum
+9704, Optum
+91205, Optum
+702, Optum
+];
+
+
+// ============================================================================
+// AFTERCARE — one row per episode
+//   RCA_Flag       1 if any qualifying care-plan MIT name is RCA
+//   Aftercare_Flag 1 if any qualifying continuing-care plan has a plan date
+//   Has_MIT_Name   QA only (plan joined, provider name missing?)
+//
+// Service-code 132 / cutoff rule, rewritten without changing the result:
+//   code <> 132                              -> plan is eligible
+//   code = 132 and plan_date >= cutoff       -> plan is eligible
+//   code = 132 and plan_date <  cutoff       -> eligible only when mass_only
+//                                                is 1 or 2
+//   code = 132 and plan_date is null         -> not eligible
+// The name test is a CASE inside the aggregate, not a trailing OR on WHERE.
+// date_of_discharge >= v_start_date_sql limits the map to the readmit window.
+// Remove that predicate if view_episode_summary_discharge names the column
+// something else.
+// ============================================================================
+
+LIB CONNECT TO 'Avatar Shadow Copy';
+
+AFTERCARE_DETAIL:
+SQL SELECT
+    d.PATID,
+    d.EPISODE_NUMBER,
+    d.PATID || '-' || CAST(d.EPISODE_NUMBER AS VARCHAR(20)) AS EpisodeKey_EPN,
+    MAX(CASE
+            WHEN mit.name LIKE '%RCA%'
+              OR mit.name LIKE '%Recovery Centers of America%'
+            THEN 1 ELSE 0
+        END) AS RCA_Flag,
+    MAX(CASE WHEN iccp.plan_date IS NOT NULL THEN 1 ELSE 0 END) AS Aftercare_Flag,
+    MAX(CASE WHEN mit.name IS NOT NULL THEN 1 ELSE 0 END)       AS Has_MIT_Name
+FROM "SYSTEM".view_episode_summary_discharge d
+LEFT JOIN CWSSYSTEM.ip_cont_care_plan iccp
+    ON  iccp.facility = d.FACILITY
+    AND iccp.patid = d.PATID
+    AND iccp.episode_number = d.EPISODE_NUMBER
+    AND (
+            d.program_X_tx_service_code <> 132
+         OR (d.program_X_tx_service_code = 132
+             AND iccp.plan_date >= '$(v_aftercare_cutoff_sql)')
+         OR (d.program_X_tx_service_code = 132
+             AND iccp.plan_date < '$(v_aftercare_cutoff_sql)'
+             AND iccp.mass_only IN ('1', '2'))
+        )
+LEFT JOIN CWSSYSTEM.ip_cont_care_plan_mit mit
+    ON  mit.FACILITY = iccp.FACILITY
+    AND mit.CUSTHOCB_UID = iccp.CUSTHOCB_UID
+    AND mit.PATID = iccp.PATID
+WHERE d.FACILITY = 1
+  AND d.program_X_RRG_code IN (2, 3)
+  AND d.date_of_discharge >= '$(v_start_date_sql)'
+GROUP BY d.PATID, d.EPISODE_NUMBER;
+
+// Maps: trimmed key in, ApplyMap trims again. Miss -> -1 (not the same as 0).
+RCA_FLAG_MAP:
+MAPPING LOAD
+    Trim(EpisodeKey_EPN) AS EpisodeKey_EPN,
+    RCA_Flag
+RESIDENT AFTERCARE_DETAIL;
+
+AFTERCARE_FLAG_MAP:
+MAPPING LOAD
+    Trim(EpisodeKey_EPN) AS EpisodeKey_EPN,
+    Aftercare_Flag
+RESIDENT AFTERCARE_DETAIL;
+
+
+IF $(v_dev_qa) = 1 THEN
+
+    // Expect QA_TotalRows = QA_DistinctKeys and the three defect counts = 0.
+    QA_Key_Check:
+    NOCONCATENATE LOAD
+        Count(EpisodeKey_EPN)                                 AS QA_TotalRows,
+        Count(DISTINCT EpisodeKey_EPN)                        AS QA_DistinctKeys,
+        Sum(If(IsNull(PATID) OR IsNull(EPISODE_NUMBER)
+            OR Len(Trim(EpisodeKey_EPN)) = 0, 1, 0))          AS QA_NullOrEmptyKeys,
+        Sum(If(EpisodeKey_EPN <> Trim(EpisodeKey_EPN), 1, 0)) AS QA_KeysWithWhitespace,
+        Sum(If(Index(EpisodeKey_EPN, '-') = 0, 1, 0))         AS QA_KeysMissingHyphen
+    RESIDENT AFTERCARE_DETAIL;
+
+    QA_Aftercare_Detail:
+    NOCONCATENATE LOAD
+        Trim(EpisodeKey_EPN) AS QA_EpisodeKey_EPN,
+        PATID                AS QA_Detail_PATID,
+        EPISODE_NUMBER       AS QA_Detail_EPISODE_NUMBER,
+        RCA_Flag             AS QA_RCA_Flag,
+        Aftercare_Flag       AS QA_Aftercare_Flag,
+        Has_MIT_Name         AS QA_Has_MIT_Name
+    RESIDENT AFTERCARE_DETAIL;
+
+    // Original population, WHERE-precedence bug kept on purpose.
+    // (A AND B AND C AND name LIKE '%RCA%') OR name LIKE '%Recovery Centers of America%'
+    // The second branch is not limited to facility, program, or the date window.
+    OLD_RCA_SET:
+    SQL SELECT DISTINCT
+        d.PATID || '-' || CAST(d.EPISODE_NUMBER AS VARCHAR(20)) AS QA_Old_Key
+    FROM "SYSTEM".view_episode_summary_discharge d
+    LEFT JOIN CWSSYSTEM.ip_cont_care_plan iccp
+      ON iccp.facility = d.FACILITY
+     AND iccp.patid = d.PATID
+     AND iccp.episode_number = d.EPISODE_NUMBER
+     AND ((d.program_X_tx_service_code = 132
+           AND iccp.plan_date < '$(v_aftercare_cutoff_sql)'
+           AND iccp.mass_only IN ('1', '2'))
+          OR (d.program_X_tx_service_code <> 132
+              OR (d.program_X_tx_service_code = 132
+                  AND iccp.plan_date >= '$(v_aftercare_cutoff_sql)')))
+    LEFT JOIN CWSSYSTEM.ip_cont_care_plan_mit mit
+      ON mit.FACILITY = iccp.FACILITY
+     AND mit.CUSTHOCB_UID = iccp.CUSTHOCB_UID
+     AND mit.PATID = iccp.PATID
+    WHERE d.FACILITY = 1
+      AND d.program_X_RRG_code IN (2, 3)
+      AND d.date_of_discharge >= '$(v_start_date_sql)'
+      AND mit.name LIKE '%RCA%' OR mit.name LIKE '%Recovery Centers of America%';
+
+    QA_Detail_Key_Map:
+    MAPPING LOAD
+        Trim(EpisodeKey_EPN) AS EpisodeKey_EPN,
+        1 AS InDetail
+    RESIDENT AFTERCARE_DETAIL;
+
+    QA_RCA_Compare:
+    NOCONCATENATE LOAD
+        QA_K,
+        1 AS QA_InOld
+    GROUP BY QA_K;
+    LOAD
+        Trim(QA_Old_Key) AS QA_K
+    RESIDENT OLD_RCA_SET;
+    DROP TABLE OLD_RCA_SET;
+
+    OUTER JOIN (QA_RCA_Compare)
+    LOAD
+        QA_K,
+        1 AS QA_InNew
+    GROUP BY QA_K;
+    LOAD
+        Trim(EpisodeKey_EPN) AS QA_K
+    RESIDENT AFTERCARE_DETAIL
+    WHERE RCA_Flag = 1;
+
+    QA_RCA_Compare_Summary:
+    NOCONCATENATE LOAD
+        QA_Bucket,
+        Count(QA_K) AS QA_Episodes
+    GROUP BY QA_Bucket;
+    LOAD
+        QA_K,
+        If(QA_InOld = 1 AND QA_InNew = 1, 'Both',
+        If(QA_InOld = 1 AND ApplyMap('QA_Detail_Key_Map', QA_K, 0) = 1,
+                                         'Old only - in detail, RCA=0',
+        If(QA_InOld = 1,                  'Old only - not in detail',
+                                          'New only'))) AS QA_Bucket
+    RESIDENT QA_RCA_Compare
+    WHERE QA_InOld = 1 OR QA_InNew = 1;
+
+END IF
+
+DROP TABLE AFTERCARE_DETAIL;
+
+
+// ============================================================================
+// SECTION 1 — DISCHARGE CODES
+// Connection: DW Prod. Loaded before the readmit connection is switched.
+// All non-deleted codes (Jony). Elopement = 'PE' (confirmed 2026-03-15).
+// PATID / EPISODE_NUMBER are not loaded as their own fields (synthetic key).
+// The table is dropped after Discharge_Code_Map is built.
+// ============================================================================
+
+LIB CONNECT TO 'DW Prod';
+
+Discharge_Details:
+SQL SELECT
+    CONCAT(PATID, '-', CAST(EPISODE_NUMBER AS VARCHAR(20))) AS EpisodeKey_EPN,
+    Discharge_code
+FROM RCA_Patient.dbo.DimPatientDischarge
+WHERE LogicalDeleteInd = 'N';
+
+IF $(v_dev_qa) = 1 THEN
+
+    // QA_DC_Rows > QA_DC_DistinctKeys means the map kept an arbitrary code.
+    QA_Discharge_Key_Check:
+    NOCONCATENATE LOAD
+        Count(EpisodeKey_EPN)          AS QA_DC_Rows,
+        Count(DISTINCT EpisodeKey_EPN) AS QA_DC_DistinctKeys
+    RESIDENT Discharge_Details;
+
+END IF
+
+
+// ============================================================================
+// SECTION 2 — READMIT BASE
+// Connection: PDCNBISQL03 (SQL Server).
+// LEAD() is ordered by preadmit_admission_date, then episode number so two
+// admits on the same timestamp resolve the same way every reload.
+// days_until_next_admit is a whole-day DATEDIFF. Interval() kept the fraction,
+// and a 7.5-day gap matched none of the buckets, so it became 'Not Readmit'
+// while Thirty_Day stayed 1.
+//
+// Date window is inclusive of the whole end date. The old predicate compared
+// a datetime to 'YYYY-MM-DD', which SQL Server treats as midnight and drops
+// the rest of that day. v_start_date is no longer formatted as MM/DD/YY.
+// ============================================================================
+
+LIB CONNECT TO 'PDCNBISQL03';
+
+// RCA_Flag_Raw / Aftercare_Flag_Raw : 1, 0, or -1 (-1 = episode not in the map)
+// Is_Unmapped                       : 1 if either raw flag is -1
+// RCA_Flag                          : legacy 1/0 for the existing RCA chart only.
+//                                     -1 is forced to 0. Do not use it in the
+//                                     new aftercare measures; use the raw flags.
+OUTER_CTE:
+LOAD
+    *,
+    If(RCA_Flag_Raw = -1 OR Aftercare_Flag_Raw = -1, 1, 0) AS Is_Unmapped,
+    If(RCA_Flag_Raw = 1, 1, 0)                             AS RCA_Flag;
+LOAD
+    *,
+    ApplyMap('RCA_FLAG_MAP',       Trim(EpisodeKey_EPN), -1) AS RCA_Flag_Raw,
+    ApplyMap('AFTERCARE_FLAG_MAP', Trim(EpisodeKey_EPN), -1) AS Aftercare_Flag_Raw;
+SQL SELECT
+    PATID,
+    EPISODE_NUMBER,
+    CONCAT(PATID, '-', CONVERT(VARCHAR(10), date_of_discharge, 23)) AS EpisodeKey,
+    CONCAT(PATID, '-', CAST(EPISODE_NUMBER AS VARCHAR(20)))         AS EpisodeKey_EPN,
+    preadmit_admission_date,
+    date_of_discharge,
+    next_admission_date,
+    DATEDIFF(DAY, date_of_discharge, next_admission_date) AS days_until_next_admit,
+    program_X_tx_service_value
+FROM (
+    SELECT
+        PATID,
+        EPISODE_NUMBER,
+        preadmit_admission_date,
+        date_of_discharge,
+        program_X_tx_service_value,
+        LEAD(preadmit_admission_date) OVER (
+            PARTITION BY PATID
+            ORDER BY preadmit_admission_date, EPISODE_NUMBER
+        ) AS next_admission_date
+    FROM [Avatar].[dbo].[view_episode_summary_admit]
+    WHERE program_X_RRG_code IN ('2', '3')
+      AND date_of_discharge >= CONVERT(DATE, '$(v_start_date_sql)', 23)
+      AND date_of_discharge <  DATEADD(DAY, 1, CONVERT(DATE, '$(v_end_date_sql)', 23))
+      AND preadmit_admission_date <> date_of_discharge
+      AND PATID <> 1
+) AS src;
+
+INNER_CTE:
+NOCONCATENATE LOAD
+    *,
+    MonthStart(date_of_discharge)                               AS discharge_month,
+    Date(MonthStart(date_of_discharge), 'MMM YYYY')             AS discharge_month_label,
+    'Q' & Ceil(Month(date_of_discharge) / 3)
+        & ' ' & Year(date_of_discharge)                         AS discharge_quarter,
+    If(date_of_discharge >= YearStart(Today()), 'YTD',
+    If(date_of_discharge >= YearStart(AddYears(Today(), -1))
+       AND date_of_discharge < YearStart(Today()), 'PYTD',
+    'Older'))                                                   AS year_bucket,
+    Year(date_of_discharge)                                     AS discharge_year
+RESIDENT OUTER_CTE;
+DROP TABLE OUTER_CTE;
+
+
+// ============================================================================
+// SECTION 3 — COHORTS
+//
+// 90_cohort: discharge date <= today-90 (grace elapsed). From the recording:
+//            a discharge 45 days ago is in the app, a discharge 10 days ago
+//            is not. 45 days clears the 30-day grace only.
+// 30_cohort: discharge date <= today-30.
+//
+// A discharge older than 90 days is in both cohorts, with different flags.
+// The 30-day cohort does not carry a 31-90 bucket and forces Ninety_Day = 0
+// so that sheet does not count 90-day readmits.
+//
+// INNER_CTE_HU is a narrow copy taken before the grace filter. The high
+// utilizer list is the only consumer (Jony: recent episodes such as patient
+// 113315 episodes 7 and 8 stay in that list).
+// ============================================================================
+
+INNER_CTE_HU:
+NOCONCATENATE LOAD
+    PATID,
+    EPISODE_NUMBER,
+    EpisodeKey_EPN,
+    preadmit_admission_date,
+    date_of_discharge,
+    program_X_tx_service_value,
+    days_until_next_admit
+RESIDENT INNER_CTE;
+
+Full_Table:
+NOCONCATENATE LOAD
+    *,
+    If(days_until_next_admit >= 0 AND days_until_next_admit <= 7,  '0 - 7 Days',
+    If(days_until_next_admit >= 8 AND days_until_next_admit <= 30, '8 - 30 Days',
+    If(days_until_next_admit >= 31 AND days_until_next_admit <= 90, '31 - 90 Days',
+    'Not Readmit')))                                            AS readmit_flag,
+    If(days_until_next_admit >= 0 AND days_until_next_admit <= 30, 1, 0) AS Thirty_Day,
+    If(days_until_next_admit >= 0 AND days_until_next_admit <= 90, 1, 0) AS Ninety_Day,
+    '90_cohort'                                                 AS cohort_source
+RESIDENT INNER_CTE
+WHERE Floor(date_of_discharge) <= $(v_grace_end_90);
+
+CONCATENATE (Full_Table)
+LOAD
+    *,
+    If(days_until_next_admit >= 0 AND days_until_next_admit <= 7,  '0 - 7 Days',
+    If(days_until_next_admit >= 8 AND days_until_next_admit <= 30, '8 - 30 Days',
+    'Not Readmit'))                                             AS readmit_flag,
+    If(days_until_next_admit >= 0 AND days_until_next_admit <= 30, 1, 0) AS Thirty_Day,
+    0                                                           AS Ninety_Day,
+    '30_cohort'                                                 AS cohort_source
+RESIDENT INNER_CTE
+WHERE Floor(date_of_discharge) <= $(v_grace_end_30);
+
+DROP TABLE INNER_CTE;
+
+
+// ============================================================================
+// DEV QA — must run before Section 4 drops Full_Table.
+// QA_NullFlagRows must be 0.
+// QA_Dedup_Conflict_Check: more than one episode on the same PATID + discharge
+// date. If QA_AftercareVariants or QA_RCAVariants is > 1, take it to Jony/Pete.
+// Do not change the dedup rule to make the conflict disappear.
+// ============================================================================
+
+IF $(v_dev_qa) = 1 THEN
+
+    QA_Null_Check:
+    NOCONCATENATE LOAD
+        Sum(If(IsNull(Aftercare_Flag_Raw) OR IsNull(RCA_Flag_Raw), 1, 0)) AS QA_NullFlagRows,
+        Count(DISTINCT If(Is_Unmapped = 1, EpisodeKey_EPN))                AS QA_UnmappedEpisodes
+    RESIDENT Full_Table;
+
+    QA_Dedup_Conflict_Check:
+    NOCONCATENATE LOAD
+        *
+    WHERE QA_EpisodeCount > 1;
+    LOAD
+        PATID                                                                  AS QA_PATID,
+        date_of_discharge                                                      AS QA_date_of_discharge,
+        Count(DISTINCT EpisodeKey_EPN)                                         AS QA_EpisodeCount,
+        Count(DISTINCT If(IsNull(Aftercare_Flag_Raw), -9, Aftercare_Flag_Raw)) AS QA_AftercareVariants,
+        Count(DISTINCT If(IsNull(RCA_Flag_Raw), -9, RCA_Flag_Raw))             AS QA_RCAVariants
+    RESIDENT Full_Table
+    GROUP BY PATID, date_of_discharge;
+
+    QA_Unmapped_Diagnosis:
+    NOCONCATENATE LOAD DISTINCT
+        EpisodeKey_EPN             AS QA_U_EpisodeKey_EPN,
+        PATID                      AS QA_U_PATID,
+        program_X_tx_service_value AS QA_U_Site,
+        discharge_month_label      AS QA_U_Month,
+        If(Exists(QA_Detail_PATID, PATID),
+           'PATID in detail: episode-level or key gap',
+           'PATID not in detail: scope or coverage') AS QA_U_Diagnosis
+    RESIDENT Full_Table
+    WHERE Is_Unmapped = 1;
+
+END IF
+
+
+// ============================================================================
+// SECTION 4 — DEDUP
+// One row per PATID + discharge date + cohort.
+// readmit_priority 0 (has a next admission) sorts first and keeps rn = 1.
+// Peek() needs the Order By load to have finished first, and Qlik cannot
+// Order By a field created in that same load, so this stays three steps.
+// cohort_source is part of the group: one episode may remain in both cohorts.
+// ============================================================================
+
+rank_prep:
+NOCONCATENATE LOAD
+    *,
+    If(IsNull(next_admission_date), 1, 0) AS readmit_priority
+RESIDENT Full_Table;
+DROP TABLE Full_Table;
+
+rank_sorted:
+NOCONCATENATE LOAD
+    *
+RESIDENT rank_prep
+ORDER BY PATID ASC, date_of_discharge ASC, cohort_source ASC, readmit_priority ASC;
+DROP TABLE rank_prep;
+
+rank_partition:
+NOCONCATENATE LOAD
+    *,
+    If(PATID = Peek('PATID')
+       AND date_of_discharge = Peek('date_of_discharge')
+       AND cohort_source = Peek('cohort_source'),
+       Peek('rn') + 1,
+       1) AS rn
+RESIDENT rank_sorted;
+DROP TABLE rank_sorted;
+
+Readmit_Transformed_Data:
+NOCONCATENATE LOAD
+    PATID,
+    EPISODE_NUMBER,
+    RCA_Flag,
+    RCA_Flag_Raw,
+    Aftercare_Flag_Raw,
+    Is_Unmapped,
+    EpisodeKey,
+    Trim(EpisodeKey_EPN) AS EpisodeKey_EPN,
+    preadmit_admission_date,
+    date_of_discharge,
+    next_admission_date,
+    program_X_tx_service_value,
+    days_until_next_admit,
+    readmit_flag,
+    Thirty_Day,
+    Ninety_Day,
+    discharge_month,
+    discharge_month_label,
+    discharge_quarter,
+    year_bucket,
+    discharge_year,
+    cohort_source
+RESIDENT rank_partition
+WHERE rn = 1
+  AND Lower(Trim(program_X_tx_service_value)) <> 'do not use';
+
+DROP TABLE rank_partition;
+
+
+// ============================================================================
+// SECTION 5 — DISCHARGE CODE, DISCHARGE TYPE, SITE, REGION
+// Measures must filter cohort_source. The same episode is in both cohorts
+// when the discharge is older than 90 days, and a chart with no cohort
+// filter double-counts those episodes. Guarantor links on EpisodeKey_EPN
+// and multiplies the same way when an episode has more than one guarantor.
+// ============================================================================
+
+Discharge_Code_Map:
+MAPPING LOAD
+    Trim(EpisodeKey_EPN) AS EpisodeKey_EPN,
+    Upper(Trim(Discharge_code)) AS Discharge_code
+RESIDENT Discharge_Details;
+
+DROP TABLE Discharge_Details;
+
+Readmit_With_Code:
+NOCONCATENATE LOAD
+    *,
+    ApplyMap('Discharge_Code_Map', EpisodeKey_EPN, Null()) AS Discharge_code,
+    // 1 when this cohort's grace end falls before the last calendar day of
+    // the discharge month. Floor() because MonthEnd() is the last millisecond
+    // of the month, which would flag a month that is actually complete.
+    If(Floor(MonthEnd(date_of_discharge)) >
+        If(cohort_source = '90_cohort', $(v_grace_end_90), $(v_grace_end_30)),
+       1, 0) AS is_partial_month
+RESIDENT Readmit_Transformed_Data;
+DROP TABLE Readmit_Transformed_Data;
+
+// Null discharge code stays 'Unknown' so it does not inflate 'Other'.
+// Unknown rows are kept until Jony says to drop them.
+Readmit_With_Type:
+NOCONCATENATE LOAD
+    *,
+    EpisodeKey_EPN AS _ReadmitEpisodeKey,
+    If(IsNull(Discharge_code),            'Unknown',
+    If(Discharge_code = 'TC',             'Treatment Complete',
+    If(Match(Discharge_code, 'AA', 'PE'), 'Against Advice + Elopement',
+    If(Discharge_code = 'DO',             'Detox Only',
+    If(Discharge_code = 'THLOC',          'Transfer to Higher Level of Care',
+    If(Discharge_code = 'PP',             'Transitioned with Partial Progress',
+    'Other'))))))                         AS discharge_type,
+    program_X_tx_service_value            AS Site,
+    ApplyMap(
+        'Region_Location_Mapping',
+        Upper(Trim(program_X_tx_service_value)),
+        'Unknown'
+    )                                     AS Region
+RESIDENT Readmit_With_Code;
+
+DROP TABLE Readmit_With_Code;
+RENAME TABLE Readmit_With_Type TO Readmit_Transformed_Data;
+
+
+// ============================================================================
+// SECTION 6 — GUARANTOR
+// QVD is not written back to. Loaded after the fact table so Exists keeps
+// only episodes that survived dedup. _ReadmitEpisodeKey is a private field
+// name: Exists(EpisodeKey_EPN) would also match keys from the maps and from
+// Discharge_Details, and those stay in the symbol table after the drop.
+// ============================================================================
+
+Guarantor_Details:
+NOCONCATENATE LOAD
+    Trim(%PatientEpisodeKey) AS EpisodeKey_EPN,
+    GUARANTOR_ID,
+    guarantor_order          AS [Guarantor Order],
+    [Guarantor Plan],
+    [Guarantor Parent Grouping],
+    [Guarantor Home Plan],
+    [Network Type],
+    ApplyMap('Guarantor_Type_Map', Text(GUARANTOR_ID), 'Others') AS [Guarantor Type],
+    If(WildMatch([Network Type], 'In Network', 'Out of Network', 'Self Pay', 'SCA'), 'Core',
+    If(WildMatch([Network Type], 'Medicaid', 'Medicare', 'Scholarship'), 'Non-Core',
+    'Section 35')) AS [Network Type Group]
+FROM [lib://QlikSense QVD Location (ad_svc-qlikadmin)/QlikSense/QVD/Transformed/E2E L2 Transform/7.MasterData/M_PATIENT_GUARANTOR.qvd](qvd)
+WHERE Exists(_ReadmitEpisodeKey, Trim(%PatientEpisodeKey));
+
+DROP FIELD _ReadmitEpisodeKey FROM Readmit_Transformed_Data;
+
+
+// ============================================================================
+// SECTION 7 — HIGH UTILIZER, NO GRACE PERIOD
+// Source: INNER_CTE_HU (grace filter not applied).
+//   2+ distinct episodes with a 30-day readmit
+//   index admission within the past 90 days (preadmit_admission_date, Pete)
+//   THLOC excluded; a null discharge code is NOT THLOC and stays in
+//     (the old `<> 'THLOC'` test dropped nulls, because null <> 'x' is null)
+//   'Do not use' sites excluded, same rule as the fact table
+//
+// The grace-period utilizer table (Multiple_Readmit_List) is not loaded.
+// Jony: only the no-grace table is used.
+// This table is an island (HU_PATID, not PATID) so selections on it do not
+// filter the dashboard.
+// ============================================================================
+
+HU_NoGrace_Base:
+NOCONCATENATE LOAD
+    PATID,
+    EPISODE_NUMBER,
+    Trim(EpisodeKey_EPN) AS EpisodeKey_EPN,
+    preadmit_admission_date,
+    date_of_discharge,
+    program_X_tx_service_value AS HU_Site,
+    days_until_next_admit,
+    If(days_until_next_admit >= 0 AND days_until_next_admit <= 30, 1, 0) AS HU_Thirty_Day
+RESIDENT INNER_CTE_HU
+WHERE Lower(Trim(program_X_tx_service_value)) <> 'do not use';
+
+DROP TABLE INNER_CTE_HU;
+
+HU_NoGrace_With_Code:
+NOCONCATENATE LOAD
+    *,
+    ApplyMap('Discharge_Code_Map', EpisodeKey_EPN, Null()) AS HU_DC_code
+RESIDENT HU_NoGrace_Base;
+
+DROP TABLE HU_NoGrace_Base;
+
+Multiple_Readmit_List_NoGrace:
+NOCONCATENATE LOAD
+    *
+WHERE HU_readmit_count >= 2;
+LOAD
+    PATID                          AS HU_PATID,
+    HU_Site,
+    Count(DISTINCT EpisodeKey_EPN) AS HU_readmit_count,
+    Min(preadmit_admission_date)   AS HU_first_readmit_date,
+    Max(preadmit_admission_date)   AS HU_last_readmit_date
+RESIDENT HU_NoGrace_With_Code
+WHERE HU_Thirty_Day = 1
+  AND Floor(preadmit_admission_date) >= $(v_grace_end_90)
+  AND Alt(Upper(Trim(HU_DC_code)), '') <> 'THLOC'
+GROUP BY
+    PATID,
+    HU_Site;
+
+DROP TABLE HU_NoGrace_With_Code;
+
+TRACE *** Readmit load complete.;
